@@ -1,17 +1,20 @@
-from msilib.schema import Error
+import queue
 from threading import Thread
 import os
 import hashlib
+import time
+from types import NoneType
 
 import win32file
 import win32con
 
-DIRECTORYCHANGEACTIONS = {
-    1: "Created",
-    2: "Deleted",
-    3: "Updated",
-    4: "Renamed from something",
-    5: "Renamed to something"
+
+DIRECTORY_CHANGE_ACTIONS = {
+    "CREATED": 1,
+    "DELETED": 2,
+    "UPDATED": 3,
+    "RENAMED_FROM": 4,
+    "RENAMED_TO": 5
 }
 # Thanks to Claudio Grondi for the correct set of numbers
 FILE_LIST_DIRECTORY = 0x0001
@@ -42,10 +45,11 @@ FILE_ATTRIBUTE = {
 
 
 class WatcherThread(Thread):
-    def __init__(self, watch_path: str) -> None:
+    def __init__(self, watch_path: str, queue: queue.Queue) -> None:
         super().__init__()
 
-        self.watch_path = watch_path
+        self.watch_path = os.path.abspath(watch_path)
+        self.queue = queue
 
         self.h_dir = win32file.CreateFile(
             self.watch_path,
@@ -83,87 +87,105 @@ class WatcherThread(Thread):
                 None,
                 None
             )
+            files = set()
             for action, file in results:
-                full_filename = os.path.join(self.watch_path, file)
-                print(full_filename, DIRECTORYCHANGEACTIONS.get(action, "Unknown"))
+                full_filename = os.path.abspath(os.path.join(
+                    self.watch_path, file))
+                if file not in files:
+                    self.queue.put(full_filename)
+                    files.add(file)
+                # print(full_filename, action)
 
 
 def crawl(crawl_path: str) -> dict:
     out_dict = dict()
-    for path in os.listdir(crawl_path):
-        abs_path = os.path.join(crawl_path, path)
-        if os.path.isdir(abs_path):
+    if os.path.isdir(crawl_path):
+        for path in os.listdir(crawl_path):
+            abs_path = os.path.join(crawl_path, path)
             try:
                 out_dict[path] = crawl(abs_path)
-                print("dir", abs_path)
+                # print("dir", abs_path)
             except Exception as e:
                 print(e)
-        elif os.path.isfile(abs_path):
-            try:
-                stat_result = os.stat(abs_path)
-                if stat_result.st_file_attributes & FILE_ATTRIBUTE["RECALL_ON_DATA_ACCESS"]:
-                    print("file", abs_path, "remote")
-                    continue  # skip non-local files
-                if stat_result.st_size > 1024**3:
-                    continue  # skip files > 1GB
-                with open(abs_path, 'rb') as f:
-                    md5 = hashlib.md5()
-                    while True:
-                        chunk = f.read(1024*64)  # read 64kB chunks
-                        if not chunk:
-                            break
-                        md5.update(chunk)
+    elif os.path.isfile(crawl_path):
+        try:
+            stat_result = os.stat(crawl_path)
+            # print(stat_result.st_size)
+            out_dict["*st_size"] = stat_result.st_size
+            if stat_result.st_file_attributes & FILE_ATTRIBUTE["RECALL_ON_DATA_ACCESS"]:
+                # print("file", crawl_path, "remote")
+                return out_dict  # skip non-local files
+            if stat_result.st_size > 1024**3:
+                return out_dict  # skip files > 1GB
+            with open(crawl_path, 'rb') as f:
+                md5 = hashlib.md5()
+                while True:
+                    chunk = f.read(1024*64)  # read 64kB chunks
+                    if not chunk:
+                        break
+                    md5.update(chunk)
 
-                out_dict[path] = md5.digest()
-                print("file", abs_path, "hash", md5.hexdigest())
-            except Exception as e:
-                print(e)
-        else:
-            print("unknown", abs_path)
+            out_dict["*hash_md5"] = md5.hexdigest()
+            # print("file", crawl_path, "hash", md5.hexdigest())
+        except Exception as e:
+            print(e)
+    else:
+        print("unknown", crawl_path)
     return out_dict
 
 
-class IndexerThread(Thread):
-    def __init__(self) -> None:
+def splitpath(path):
+    allparts = []
+    while 1:
+        parts = os.path.split(path)
+        if parts[0] == path:  # sentinel for absolute paths
+            allparts.insert(0, parts[0])
+            break
+        elif parts[1] == path:  # sentinel for relative paths
+            allparts.insert(0, parts[1])
+            break
+        else:
+            path = parts[0]
+            allparts.insert(0, parts[1])
+    return allparts
+
+
+def update_crawl_index(ci_path: str, ci: dict, new_ci_path: str, new_ci: dict):
+    new_path_segments = splitpath(os.path.abspath(new_ci_path))[
+        len(splitpath(os.path.abspath(ci_path))):]
+
+    out_dict = ci
+    repl = out_dict
+    for seg in new_path_segments[:-1]:
+        repl = repl[seg]
+    repl[new_path_segments[-1]] = new_ci
+
+    return out_dict
+
+
+class CrawlWorkerThread(Thread):
+    def __init__(self, crawl_path: str, crawl_queue: queue.Queue) -> None:
         super().__init__()
 
+        self.crawl_path = os.path.abspath(crawl_path)
+        self.crawl_queue = crawl_queue
+
+        self.file_index = dict()
+        self.last_indexed: NoneType | float = None
+
     def run(self) -> None:
-        pass
-
-
-def print_st_file_attributes(st_file_attributes):
-    print({
-        "readonly": st_file_attributes & 0x1,
-        "hidden": st_file_attributes & 0x2,
-        "system": st_file_attributes & 0x4,
-        "directory": st_file_attributes & 0x10,
-        "archive": st_file_attributes & 0x20,
-        "device": st_file_attributes & 0x40,
-        "normal": st_file_attributes & 0x80,
-        "temporary": st_file_attributes & 0x100,
-        "sparse_file": st_file_attributes & 0x200,
-        "reparse_point": st_file_attributes & 0x400,
-        "compressed": st_file_attributes & 0x800,
-        "offline": st_file_attributes & 0x1000,
-        "not_content_indexed": st_file_attributes & 0x2000,
-        "encrypted": st_file_attributes & 0x4000,
-        "integrity_stream": st_file_attributes & 0x8000,
-        "virtual": st_file_attributes & 0x10000,
-        "no_scrub_data": st_file_attributes & 0x20000,
-        "recall_on_open": st_file_attributes & 0x40000,
-        "pinned": st_file_attributes & 0x80000,
-        "unpinned": st_file_attributes & 0x100000,
-        "recall_on_data_access": st_file_attributes & 0x400000,
-    })
+        while True:
+            if not self.last_indexed or time.time() - self.last_indexed > 120:
+                with self.crawl_queue.mutex:
+                    self.file_index = crawl(self.crawl_path)
+                    self.crawl_queue.queue.clear()
+            try:
+                crawl_item: str = self.crawl_queue.get(block=False)
+                self.file_index = update_crawl_index(
+                    self.crawl_path, self.file_index, crawl_item, crawl(crawl_item))
+            except queue.Empty:
+                pass
 
 
 if __name__ == "__main__":
-    # stat = os.stat('C:\\Users\\silvi\\OneDrive\\Dokumente\\Default.rdp',
-    #                follow_symlinks=False)
-    # print(stat)
-    # print_st_file_attributes(stat.st_file_attributes)
-
-    # watchThr = WatcherThread('.')
-    # watchThr.start()
-
-    crawl('C:\\Users\\silvi\\OneDrive\\Dokumente')
+    pass
