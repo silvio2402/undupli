@@ -7,6 +7,7 @@ from configparser import ConfigParser
 from tkinter import *
 from queue import Queue
 from threading import Event
+from tkui import EditableList
 
 
 class App(Tk):
@@ -58,12 +59,9 @@ class App(Tk):
         self.indexes = []
 
     def build_ui(self):
-        self.ui_indexing_path_entries = []
-        for i, i_path in enumerate([*self.indexing_paths, ""]):
-            entr = Entry(self)
-            entr.insert(0, i_path)
-            entr.grid(row=i)
-            self.ui_indexing_path_entries = entr
+        self.ui_indexing_path_editlist = EditableList(
+            self, item_list=self.indexing_paths)
+        self.ui_indexing_path_editlist.place(x=0, y=0, relwidth=1, relheight=1)
 
     def quit_window(self, icon: pystray.Icon, item: str):
         self.write_config()
