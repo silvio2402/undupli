@@ -1,5 +1,5 @@
 import queue
-from threading import Thread
+from threading import Thread, Event
 import os
 import hashlib
 import time
@@ -45,11 +45,12 @@ FILE_ATTRIBUTE = {
 
 
 class WatcherThread(Thread):
-    def __init__(self, watch_path: str, queue: queue.Queue) -> None:
+    def __init__(self, watch_path: str, queue: queue.Queue, stop_event: Event) -> None:
         super().__init__()
 
         self.watch_path = os.path.abspath(watch_path)
         self.queue = queue
+        self.stop_event = stop_event
 
         self.h_dir = win32file.CreateFile(
             self.watch_path,
@@ -63,6 +64,8 @@ class WatcherThread(Thread):
 
     def run(self) -> None:
         while True:
+            if self.stop_event.is_set():
+                return
             #
             # ReadDirectoryChangesW takes a previously-created
             # handle to a directory, a buffer size for results,
@@ -100,6 +103,7 @@ class WatcherThread(Thread):
 def crawl(crawl_path: str) -> dict:
     out_dict = dict()
     if os.path.isdir(crawl_path):
+        # print(os.listdir(crawl_path))
         for path in os.listdir(crawl_path):
             abs_path = os.path.join(crawl_path, path)
             try:
@@ -131,6 +135,7 @@ def crawl(crawl_path: str) -> dict:
             print(e)
     else:
         print("unknown", crawl_path)
+        return None
     return out_dict
 
 
@@ -164,25 +169,32 @@ def update_crawl_index(ci_path: str, ci: dict, new_ci_path: str, new_ci: dict):
 
 
 class CrawlWorkerThread(Thread):
-    def __init__(self, crawl_path: str, crawl_queue: queue.Queue) -> None:
+    def __init__(self, crawl_path: str, crawl_queue: queue.Queue, stop_event: Event) -> None:
         super().__init__()
 
         self.crawl_path = os.path.abspath(crawl_path)
         self.crawl_queue = crawl_queue
+        self.stop_event = stop_event
 
         self.file_index = dict()
         self.last_indexed: NoneType | float = None
 
     def run(self) -> None:
         while True:
-            if not self.last_indexed or time.time() - self.last_indexed > 120:
+            if self.stop_event.is_set():
+                return
+
+            if not self.last_indexed or time.time() - self.last_indexed > 60*60*2:
                 with self.crawl_queue.mutex:
                     self.file_index = crawl(self.crawl_path)
+                    print("done routine crawl", self.crawl_path)
+                    self.last_indexed = time.time()
                     self.crawl_queue.queue.clear()
             try:
                 crawl_item: str = self.crawl_queue.get(block=False)
                 self.file_index = update_crawl_index(
                     self.crawl_path, self.file_index, crawl_item, crawl(crawl_item))
+                print("done crawl", crawl_item)
             except queue.Empty:
                 pass
 
